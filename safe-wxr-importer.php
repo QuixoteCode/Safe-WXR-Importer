@@ -2,7 +2,7 @@
 /**
 * Plugin Name: Safe WXR Importer
 * Description: Import WordPress WXR exports with quarantined, validated image downloads and conservative cybersecurity defaults, does not guarantee safety.
-* Version: 0.0.1
+* Version: 0.0.2
 * Requires at least: 6.2
 * Requires PHP: 7.4
 * Author: Lucas
@@ -14,7 +14,7 @@ if (!defined('ABSPATH')) {
 }
 
 class Safe_WXR_Importer {
-    const VERSION = '0.0.1';
+    const VERSION = '0.0.2';
     const MAX_XML_BYTES = 15 * 1024 * 1024;
     const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
     const MAX_IMAGES = 250;
@@ -181,8 +181,19 @@ public static function handle_import() {
     $import_media = !empty($_POST['swi_import_media']);
     $skip_existing = !empty($_POST['swi_skip_existing']);
     $author_id = get_current_user_id();
+
     $url_map = array();
-    $counts = array('created' => 0, 'skipped' => 0, 'media' => 0, 'media_failed' => 0, 'errors' => 0);
+    $attachment_id_map = array();
+    $pending_featured_images = array();
+
+    $counts = array(
+        'created' => 0,
+        'skipped' => 0,
+        'media' => 0,
+        'media_failed' => 0,
+        'errors' => 0,
+    );
+
     $media_seen = 0;
 
     // Create terms before posts so categories and tags can be assigned
@@ -190,25 +201,51 @@ public static function handle_import() {
 
     foreach ($items as $item) {
         $item_wp = $item->children($wpns);
+    
+        // Read the source featured-image attachment ID from WXR postmeta
+        $source_thumbnail_id = 0;
+    
+        foreach ($item_wp->postmeta as $meta) {
+            if ((string) $meta->meta_key === '_thumbnail_id') {
+                $source_thumbnail_id = (int) $meta->meta_value;
+                break;
+            }
+        }
+    
         $type = (string) $item_wp->post_type;
         $status = (string) $item_wp->status;
         $slug = sanitize_title((string) $item_wp->post_name);
 
         if ($type === 'attachment') {
             $source_url = trim((string) $item_wp->attachment_url);
-
+            $source_attachment_id = (int) $item_wp->post_id;
+        
             if ($import_media && $source_url !== '' && $media_seen < self::MAX_IMAGES) {
                 $media_seen++;
-                $attachment_id = self::import_image($source_url, (string) $item->title, $author_id);
-
+        
+                $attachment_id = self::import_image(
+                    $source_url,
+                    (string) $item->title,
+                    $author_id
+                );
+        
                 if (is_wp_error($attachment_id)) {
                     $counts['media_failed']++;
                 } else {
                     $counts['media']++;
-                    $url_map[$source_url] = wp_get_attachment_url($attachment_id);
+        
+                    if ($source_attachment_id > 0) {
+                        $attachment_id_map[$source_attachment_id] = (int) $attachment_id;
+                    }
+        
+                    $local_url = wp_get_attachment_url($attachment_id);
+        
+                    if ($local_url) {
+                        $url_map[$source_url] = $local_url;
+                    }
                 }
             }
-
+        
             continue;
         }
 
@@ -270,6 +307,21 @@ public static function handle_import() {
         }
 
         self::assign_item_terms($item, $wpns, $post_id, $term_map);
+
+        if ($source_thumbnail_id > 0) {
+            $pending_featured_images[$post_id] = $source_thumbnail_id;
+        }
+    }
+
+    if ($import_media && !empty($pending_featured_images)) {
+        foreach ($pending_featured_images as $post_id => $source_attachment_id) {
+            if (isset($attachment_id_map[$source_attachment_id])) {
+                set_post_thumbnail(
+                    (int) $post_id,
+                    (int) $attachment_id_map[$source_attachment_id]
+                );
+            }
+        }
     }
 
     // Replace source attachment URLs only when a corresponding safe local image was imported
@@ -350,6 +402,33 @@ private static function assign_item_terms($item, $wpns, $post_id, $term_map) {
 }
 
 private static function import_image($url, $title, $author_id) {
+    // Check for an existing image before downloading.
+    $url_path = wp_parse_url($url, PHP_URL_PATH);
+    $source_filename = sanitize_file_name(
+        rawurldecode(wp_basename((string) $url_path))
+    );
+
+    if ($source_filename !== '') {
+        $source_name = pathinfo($source_filename, PATHINFO_FILENAME);
+
+        $existing_id = self::find_image_by_filename($source_filename);
+
+        // JPEG files may be stored with either .jpg or .jpeg.
+        if ($existing_id === 0) {
+            $extension = strtolower(pathinfo($source_filename, PATHINFO_EXTENSION));
+
+            if (in_array($extension, array('jpg', 'jpeg'), true)) {
+                $alternate_filename = $source_name . ($extension === 'jpg' ? '.jpeg' : '.jpg');
+
+                $existing_id = self::find_image_by_filename($alternate_filename);
+            }
+        }
+
+        if ($existing_id > 0) {
+            return $existing_id;
+        }
+    }
+
     $download = self::safe_download_image($url);
 
     if (is_wp_error($download)) {
@@ -389,7 +468,14 @@ private static function import_image($url, $title, $author_id) {
         return new WP_Error('swi_output_type', 'Processed image has an unsupported format or size.');
     }
 
-    $filename = sanitize_file_name(sanitize_title($title ?: 'imported-image') . '-' . wp_generate_password(6, false, false) . '.' . self::ALLOWED_MIMES[$safe_mime]);
+    $source_name = $source_filename !== ''
+        ? pathinfo($source_filename, PATHINFO_FILENAME)
+        : sanitize_title($title ?: 'imported-image');
+
+    $filename = sanitize_file_name(
+        $source_name . '.' . self::ALLOWED_MIMES[$safe_mime]
+    );
+
     $file_array = array('name' => $filename, 'tmp_name' => $safe_file, 'type' => $safe_mime, 'size' => filesize($safe_file), 'error' => 0);
 
     require_once ABSPATH . 'wp-admin/includes/file.php';
@@ -410,6 +496,55 @@ private static function import_image($url, $title, $author_id) {
     update_post_meta($attachment_id, '_swi_imported_safe_image', 1);
 
     return $attachment_id;
+}
+
+private static function find_image_by_filename($filename) {
+    global $wpdb;
+
+    $filename = sanitize_file_name($filename);
+
+    if ($filename === '') {
+        return 0;
+    }
+
+    // Search attachment file metadata, then verify the exact basename.
+    $like = '%' . $wpdb->esc_like($filename);
+
+    $attachment_ids = $wpdb->get_col(
+        $wpdb->prepare(
+            "SELECT DISTINCT p.ID
+            FROM {$wpdb->posts} AS p
+            INNER JOIN {$wpdb->postmeta} AS pm
+                ON p.ID = pm.post_id
+            WHERE p.post_type = 'attachment'
+                AND p.post_mime_type IN (
+                    'image/jpeg',
+                    'image/png',
+                    'image/webp'
+                )
+                AND pm.meta_key = '_wp_attached_file'
+                AND pm.meta_value LIKE %s",
+            $like
+        )
+    );
+
+    foreach ($attachment_ids as $attachment_id) {
+        $attached_file = get_post_meta(
+            (int) $attachment_id,
+            '_wp_attached_file',
+            true
+        );
+
+        if (
+            is_string($attached_file) &&
+            wp_basename($attached_file) === $filename &&
+            wp_attachment_is_image((int) $attachment_id)
+        ) {
+            return (int) $attachment_id;
+        }
+    }
+
+    return 0;
 }
 
 private static function safe_download_image($url) {
