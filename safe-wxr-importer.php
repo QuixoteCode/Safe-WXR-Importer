@@ -1,749 +1,515 @@
 <?php
 /**
-* Plugin Name: Safe WXR Importer
-* Description: Import WordPress WXR exports with quarantined, validated image downloads and conservative cybersecurity defaults, does not guarantee safety.
-* Version: 0.0.2
-* Requires at least: 6.2
-* Requires PHP: 7.4
-* Author: Lucas
-* Text Domain: safe-wxr-importer
-*/
+ * Plugin Name: Safe WXR Importer
+ * Description: Import WordPress WXR exports with quarantined, validated image downloads and conservative cybersecurity defaults, does not guarantee safety.
+ * Version: 0.0.3
+ * Requires at least: 6.2
+ * Requires PHP: 7.4
+ * Author: Lucas
+ * Text Domain: safe-wxr-importer
+ */
 
 if (!defined('ABSPATH')) {
     exit;
 }
 
 class Safe_WXR_Importer {
-    const VERSION = '0.0.2';
-    const MAX_XML_BYTES = 15 * 1024 * 1024;
-    const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
-    const MAX_IMAGES = 250;
-    const MAX_REDIRECTS = 3;
-    const ALLOWED_MIMES = array(
-        'image/jpeg' => 'jpg',
-        'image/png' => 'png',
-        'image/webp' => 'webp',
-    );
+    const V = '0.0.3';
+    const MX = 15728640;       // WXR maximum: 15 MiB
+    const MI = 12582912;       // Image maximum: 12 MiB
+    const MI2 = 250;           // Maximum image attachments processed per import
+    const MR = 3;              // Maximum redirects
+    const AM = ['image/jpeg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp'];
 
     public static function init() {
-        add_action('admin_menu', array(__CLASS__, 'register_menu'));
-        add_action('admin_post_swi_import', array(__CLASS__, 'handle_import'));
+        add_action('admin_menu', [__CLASS__, 'register_menu']);
+        add_action('admin_post_swi_import', [__CLASS__, 'handle_import']);
     }
 
     public static function register_menu() {
-        add_management_page(
-            'Safe WXR Importer',
-            'Safe WXR Importer',
-            'import',
-            'safe-wxr-importer',
-            array(__CLASS__, 'page')
-        );
+        add_management_page('Safe WXR Importer', 'Safe WXR Importer', 'import', 'safe-wxr-importer', [__CLASS__, 'page']);
     }
 
     public static function page() {
         if (!current_user_can('import')) {
             wp_die(esc_html__('You do not have permission to import content.', 'safe-wxr-importer'));
         }
-    ?>
-
-    <div class="wrap">
-        <h1>Safe WXR Importer</h1>
-        <p>Import posts, pages, categories, tags, and optionally approved images from a WordPress eXtended RSS (WXR) export.</p>
-        <div class="notice notice-warning"><p><strong>Security note:</strong> Use a staging site and backup first. This importer reduces risk but cannot guarantee files are harmless. It imports only JPEG, PNG, and WebP images; SVG, PDF, HTML, and executable files are excluded.</p></div>
-
-        <?php if (!empty($_GET['swi_result'])): ?>
-
-            <div class="notice notice-info"><p><?php echo esc_html(wp_unslash($_GET['swi_result'])); ?></p></div>
-
-        <?php endif; ?>
-
-        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" enctype="multipart/form-data">
-            <input type="hidden" name="action" value="swi_import">
-
-            <?php wp_nonce_field('swi_import', 'swi_nonce'); ?>
-
-            <table class="form-table" role="presentation">
-                <tr>
-                    <th scope="row">
-                        <label for="swi_wxr">WXR XML file</label>
-                    </th>
-                    <td>
-                        <input
-                            type="file"
-                            id="swi_wxr"
-                            name="swi_wxr"
-                            accept=".xml,text/xml,application/xml"
-                            required
-                        >
-                        <p class="description">
-                            Maximum file size: 15 MB. Upload a WordPress export XML file.
-                        </p>
-                    </td>
-                </tr>
-                <tr>
-                    <th scope="row">Media handling</th>
-                    <td>
-                        <label>
-                            <input
-                                type="checkbox"
-                                name="swi_import_media"
-                                value="1"
-                            >
-                            Download and import eligible images referenced by attachment records
-                        </label>
-                        <p class="description">
-                            Off by default. Only public HTTP(S) URLs and JPEG, PNG, or WebP images
-                            up to 12 MB are accepted. Downloads are not followed automatically
-                            through redirects; each redirect is revalidated.
-                        </p>
-                    </td>
-                </tr>
-                <tr>
-                    <th scope="row">Existing content</th>
-                    <td>
-                        <label>
-                            <input
-                                type="checkbox"
-                                name="swi_skip_existing"
-                                value="1"
-                                checked
-                            >
-                            Skip posts/pages with the same post type and slug
-                        </label>
-                    </td>
-                </tr>
-            </table>
-            <?php submit_button('Import safely'); ?>
-        </form>
-        <hr><h2>Included safeguards</h2>
-        <ul style="list-style:disc;padding-left:24px;">
-            <li>Requires WordPress import capability and a valid nonce.</li>
-            <li>Rejects oversized XML and documents containing a DOCTYPE declaration.</li>
-            <li>Parses XML without network access or entity substitution.</li>
-            <li>Does not execute imported content, PHP, or scripts.</li>
-            <li>Media fetching is opt-in, size-limited, redirect-limited, and blocks local/private IP destinations.</li>
-            <li>Checks file signatures and MIME types; rejects SVG and non-raster files.</li>
-            <li>Re-encodes accepted images with the WordPress image editor before adding them to the Media Library.</li>
-        </ul>
-    </div>
-    <?php
-}
-
-public static function handle_import() {
-    if (!current_user_can('import')) {
-        wp_die(esc_html__('You do not have permission to import content.', 'safe-wxr-importer'));
-    }
-    check_admin_referer('swi_import', 'swi_nonce');
-
-    if (empty($_FILES['swi_wxr']) || !isset($_FILES['swi_wxr']['error']) || UPLOAD_ERR_OK !== (int) $_FILES['swi_wxr']['error']) {
-        self::redirect('Upload failed. Please select a valid XML file.');
+        ?>
+        <div class="wrap">
+            <h1>Safe WXR Importer</h1>
+            <p>Import posts, pages, categories, tags, and optionally approved images from a WXR export.</p>
+            <div class="notice notice-warning"><p><strong>Security note:</strong> Use a staging site and backup first. Only JPEG, PNG, and WebP images are imported.</p></div>
+            <?php if (!empty($_GET['swi_result'])) : ?>
+                <div class="notice notice-info"><p><?php echo esc_html(wp_unslash($_GET['swi_result'])); ?></p></div>
+            <?php endif; ?>
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" enctype="multipart/form-data">
+                <input type="hidden" name="action" value="swi_import">
+                <?php wp_nonce_field('swi_import', 'swi_nonce'); ?>
+                <table class="form-table">
+                    <tr><th><label for="swi_wxr">WXR XML file</label></th><td><input type="file" id="swi_wxr" name="swi_wxr" accept=".xml,text/xml,application/xml" required><p class="description">Max 15 MB.</p></td></tr>
+                    <tr><th>Media</th><td><label><input type="checkbox" name="swi_import_media" value="1"> Download images (opt-in, public HTTP(S) only, JPEG/PNG/WebP â‰¤12 MB)</label></td></tr>
+                    <tr><th>Existing</th><td><label><input type="checkbox" name="swi_skip_existing" value="1" checked> Skip existing posts/pages by slug</label></td></tr>
+                </table>
+                <?php submit_button('Import safely'); ?>
+            </form>
+        </div>
+        <?php
     }
 
-    $file = $_FILES['swi_wxr'];
+    public static function handle_import() {
+        if (!current_user_can('import')) {
+            wp_die(esc_html__('No permission.', 'safe-wxr-importer'));
+        }
+        check_admin_referer('swi_import', 'swi_nonce');
 
-    if (!empty($file['size']) && (int) $file['size'] > self::MAX_XML_BYTES) {
-        self::redirect('XML file exceeds the 15 MB limit.');
-    }
+        $f = $_FILES['swi_wxr'] ?? [];
+        if (empty($f) || !isset($f['error']) || UPLOAD_ERR_OK !== (int) $f['error']) {
+            self::redirect('Upload failed.');
+        }
+        if (!empty($f['size']) && (int) $f['size'] > self::MX) {
+            self::redirect('File exceeds 15 MB.');
+        }
+        $tmp = $f['tmp_name'] ?? '';
+        if (!$tmp || !is_uploaded_file($tmp)) {
+            self::redirect('Invalid upload.');
+        }
+        $raw = file_get_contents($tmp);
+        if ($raw === false || $raw === '' || strlen($raw) > self::MX) {
+            self::redirect('Could not read file.');
+        }
+        if (preg_match('/<!DOCTYPE\b/i', $raw)) {
+            self::redirect('DOCTYPE not allowed.');
+        }
 
-    $tmp = isset($file['tmp_name']) ? $file['tmp_name'] : '';
+        libxml_use_internal_errors(true);
+        $xml = simplexml_load_string($raw, 'SimpleXMLElement', LIBXML_NONET | LIBXML_NOCDATA | LIBXML_COMPACT);
+        if (!$xml || strtolower($xml->getName()) !== 'rss') {
+            libxml_clear_errors();
+            self::redirect('Not a valid WXR file.');
+        }
+        $ns = $xml->getNamespaces(true);
+        if (empty($ns['wp'])) {
+            self::redirect('No WordPress WXR data found.');
+        }
 
-    if (!$tmp || !is_uploaded_file($tmp)) {
-        self::redirect('The uploaded file could not be verified.');
-    }
+        $wpns = $ns['wp'];
+        $ch = $xml->channel;
+        $items = $ch->item ?? [];
+        $im = !empty($_POST['swi_import_media']);
+        $sk = !empty($_POST['swi_skip_existing']);
+        $uid = get_current_user_id();
+        $um = [];                 // Original URL => local URL
+        $am = [];                 // Source attachment ID => local attachment ID
+        $pi = [];                 // Local post ID => source featured attachment ID
+        $c = ['cr' => 0, 'sk' => 0, 'md' => 0, 'mf' => 0, 'er' => 0, 'media_limit' => 0];
+        $fc = ['pending' => 0, 'assigned' => 0, 'failed' => 0, 'missing' => 0];
+        $ms = 0;
+        $tm = self::it($ch, $wpns);
 
-    $raw = file_get_contents($tmp);
+        foreach ($items as $item) {
+            $iw = $item->children($wpns);
+            $tid = 0;
+            foreach ($iw->postmeta as $m) {
+                if ((string) $m->meta_key === '_thumbnail_id') {
+                    $tid = (int) $m->meta_value;
+                    break;
+                }
+            }
 
-    if ($raw === false || $raw === '' || strlen($raw) > self::MAX_XML_BYTES) {
-        self::redirect('Could not read the XML file or file is too large.');
-    }
+            $t = (string) $iw->post_type;
+            $s = (string) $iw->status;
+            $sl = sanitize_title((string) $iw->post_name);
 
-    if (preg_match('/<!DOCTYPE\b/i', $raw)) {
-        self::redirect('XML with a DOCTYPE declaration is not accepted.');
-    }
+            if ($t === 'attachment') {
+                $u = trim((string) $iw->attachment_url);
+                $aid = (int) $iw->post_id;
+                if ($im && $u !== '' && $ms < self::MI2) {
+                    $ms++;
+                    $r = self::ii($u, (string) $item->title, $uid);
+                    if (is_wp_error($r)) {
+                        $c['mf']++;
+                        error_log(sprintf('[SWI] Image import failed: source_url=%s code=%s message=%s', $u, $r->get_error_code(), $r->get_error_message()));
+                    } else {
+                        $c['md']++;
+                        if ($aid > 0) {
+                            $am[$aid] = (int) $r;
+                        }
+                        $lu = wp_get_attachment_url($r);
+                        if ($lu) {
+                            $um[$u] = $lu;
+                        }
+                    }
+                } elseif ($im && $u !== '' && $ms >= self::MI2) {
+                    $c['media_limit']++;
+                    error_log(sprintf('[SWI] Media limit reached: source_attachment=%d source_url=%s', $aid, $u));
+                }
+                continue;
+            }
 
-    libxml_use_internal_errors(true);
-    $xml = simplexml_load_string($raw, 'SimpleXMLElement', LIBXML_NONET | LIBXML_NOCDATA | LIBXML_COMPACT);
+            if (!in_array($t, ['post', 'page'], true)) {
+                continue;
+            }
+            if (!in_array($s, ['publish', 'future', 'draft', 'pending', 'private'], true)) {
+                $s = 'draft';
+            }
+            $ti = wp_strip_all_tags((string) $item->title, true);
+            $co = (string) $item->children('content', true)->encoded;
+            if ($co === '') {
+                $co = (string) $item->description;
+            }
+            $co = wp_kses_post($co);
+            $g = (string) $item->guid;
 
-    if (!$xml || strtolower($xml->getName()) !== 'rss') {
-        libxml_clear_errors();
-        self::redirect('The file is not a valid WordPress WXR RSS export.');
-    }
+            if ($sk && $sl !== '' && get_page_by_path($sl, OBJECT, $t)) {
+                $c['sk']++;
+                continue;
+            }
 
-    $namespaces = $xml->getNamespaces(true);
-
-    if (empty($namespaces['wp'])) {
-        self::redirect('This XML does not appear to contain WordPress WXR data.');
-    }
-
-    $wpns = $namespaces['wp'];
-    $channel = $xml->channel;
-    $items = isset($channel->item) ? $channel->item : array();
-    $import_media = !empty($_POST['swi_import_media']);
-    $skip_existing = !empty($_POST['swi_skip_existing']);
-    $author_id = get_current_user_id();
-
-    $url_map = array();
-    $attachment_id_map = array();
-    $pending_featured_images = array();
-
-    $counts = array(
-        'created' => 0,
-        'skipped' => 0,
-        'media' => 0,
-        'media_failed' => 0,
-        'errors' => 0,
-    );
-
-    $media_seen = 0;
-
-    // Create terms before posts so categories and tags can be assigned
-    $term_map = self::import_terms($channel, $wpns);
-
-    foreach ($items as $item) {
-        $item_wp = $item->children($wpns);
-    
-        // Read the source featured-image attachment ID from WXR postmeta
-        $source_thumbnail_id = 0;
-    
-        foreach ($item_wp->postmeta as $meta) {
-            if ((string) $meta->meta_key === '_thumbnail_id') {
-                $source_thumbnail_id = (int) $meta->meta_value;
-                break;
+            $pa = [
+                'post_type' => $t,
+                'post_status' => $s,
+                'post_title' => $ti,
+                'post_name' => $sl,
+                'post_content' => $co,
+                'post_excerpt' => wp_kses_post((string) $item->description),
+                'post_date' => self::sd((string) $item->pubDate),
+                'post_author' => $uid,
+                'comment_status' => 'closed',
+                'ping_status' => 'closed',
+            ];
+            $pid = wp_insert_post(wp_slash($pa), true);
+            if (is_wp_error($pid)) {
+                $c['er']++;
+                error_log(sprintf('[SWI] Post creation failed: type=%s slug=%s message=%s', $t, $sl, $pid->get_error_message()));
+                continue;
+            }
+            $c['cr']++;
+            if ($sl !== '') {
+                update_post_meta($pid, '_swi_source_slug', $sl);
+            }
+            if ($g !== '') {
+                update_post_meta($pid, '_swi_source_guid_hash', hash('sha256', $g));
+            }
+            self::at($item, $wpns, $pid, $tm);
+            if ($tid > 0) {
+                $pi[$pid] = $tid;
             }
         }
-    
-        $type = (string) $item_wp->post_type;
-        $status = (string) $item_wp->status;
-        $slug = sanitize_title((string) $item_wp->post_name);
 
-        if ($type === 'attachment') {
-            $source_url = trim((string) $item_wp->attachment_url);
-            $source_attachment_id = (int) $item_wp->post_id;
-        
-            if ($import_media && $source_url !== '' && $media_seen < self::MAX_IMAGES) {
-                $media_seen++;
-        
-                $attachment_id = self::import_image(
-                    $source_url,
-                    (string) $item->title,
-                    $author_id
-                );
-        
-                if (is_wp_error($attachment_id)) {
-                    $counts['media_failed']++;
+        // Assign featured images only after all attachment items have been processed
+        if ($im && !empty($pi)) {
+            foreach ($pi as $pid => $sid) {
+                $pid = (int) $pid;
+                $sid = (int) $sid;
+                $fc['pending']++;
+
+                if (!isset($am[$sid])) {
+                    $fc['missing']++;
+                    error_log(sprintf('[SWI] Featured image missing: post=%d source_attachment=%d', $pid, $sid));
+                    continue;
+                }
+
+                $na = (int) $am[$sid];
+                if ($na <= 0 || get_post_type($na) !== 'attachment' || !wp_attachment_is_image($na)) {
+                    $fc['failed']++;
+                    error_log(sprintf('[SWI] Invalid image attachment: post=%d source_attachment=%d local_attachment=%d', $pid, $sid, $na));
+                    continue;
+                }
+
+                $result = set_post_thumbnail($pid, $na);
+                if ((int) get_post_thumbnail_id($pid) === $na) {
+                    $fc['assigned']++;
                 } else {
-                    $counts['media']++;
-        
-                    if ($source_attachment_id > 0) {
-                        $attachment_id_map[$source_attachment_id] = (int) $attachment_id;
-                    }
-        
-                    $local_url = wp_get_attachment_url($attachment_id);
-        
-                    if ($local_url) {
-                        $url_map[$source_url] = $local_url;
-                    }
+                    $fc['failed']++;
+                    error_log(sprintf('[SWI] Featured image assignment failed: post=%d source_attachment=%d local_attachment=%d result=%s', $pid, $sid, $na, var_export($result, true)));
                 }
             }
-        
-            continue;
         }
 
-        if (!in_array($type, array('post', 'page'), true)) {
-            continue;
-        }
-
-        if (!in_array($status, array('publish', 'future', 'draft', 'pending', 'private'), true)) {
-            $status = 'draft';
-        }
-
-        $title = wp_strip_all_tags((string) $item->title, true);
-        $content = (string) $item->children('content', true)->encoded;
-
-        if ($content === '') {
-            $content = (string) $item->description;
-        }
-
-        $content = wp_kses_post($content);
-        $guid = (string) $item->guid;
-
-        if ($skip_existing && $slug !== '') {
-            $existing = get_page_by_path($slug, OBJECT, $type);
-
-            if ($existing) {
-                $counts['skipped']++;
-                continue;
-            }
-        }
-
-        $postarr = array(
-            'post_type' => $type,
-            'post_status' => $status,
-            'post_title' => $title,
-            'post_name' => $slug,
-            'post_content' => $content,
-            'post_excerpt' => wp_kses_post((string) $item->description),
-            'post_date' => self::safe_date((string) $item->pubDate),
-            'post_author' => $author_id,
-            'comment_status' => 'closed',
-            'ping_status' => 'closed',
-        );
-
-        $post_id = wp_insert_post(wp_slash($postarr), true);
-
-        if (is_wp_error($post_id)) {
-            $counts['errors']++;
-            continue;
-        }
-
-        $counts['created']++;
-
-        if ($slug !== '') {
-            update_post_meta($post_id, '_swi_source_slug', $slug);
-        }
-
-        if ($guid !== '') {
-            update_post_meta($post_id, '_swi_source_guid_hash', hash('sha256', $guid));
-        }
-
-        self::assign_item_terms($item, $wpns, $post_id, $term_map);
-
-        if ($source_thumbnail_id > 0) {
-            $pending_featured_images[$post_id] = $source_thumbnail_id;
-        }
-    }
-
-    if ($import_media && !empty($pending_featured_images)) {
-        foreach ($pending_featured_images as $post_id => $source_attachment_id) {
-            if (isset($attachment_id_map[$source_attachment_id])) {
-                set_post_thumbnail(
-                    (int) $post_id,
-                    (int) $attachment_id_map[$source_attachment_id]
-                );
-            }
-        }
-    }
-
-    // Replace source attachment URLs only when a corresponding safe local image was imported
-    if (!empty($url_map)) {
-        foreach (get_posts(array('post_type' => array('post','page'), 'post_status' => array('publish','future','draft','pending','private'), 'numberposts' => -1, 'meta_key' => '_swi_source_guid_hash')) as $post) {
-            $content = $post->post_content;
-            $updated = str_replace(array_keys($url_map), array_values($url_map), $content);
-
-            if ($updated !== $content) {
-                wp_update_post(array('ID' => $post->ID, 'post_content' => $updated));
-            }
-        }
-    }
-
-    $message = sprintf('Import complete. Created: %d; skipped: %d; images imported: %d; image failures: %d; content errors: %d.', $counts['created'], $counts['skipped'], $counts['media'], $counts['media_failed'], $counts['errors']);
-    self::redirect($message);
-}
-
-private static function import_terms($channel, $wpns) {
-    $map = array('category' => array(), 'tag' => array());
-
-    foreach (array('category' => 'category', 'tag' => 'tag') as $kind => $taxonomy) {
-        foreach ($channel->children($wpns)->{$kind} as $term) {
-            $termwp = $term->children($wpns);
-            $name = sanitize_text_field((string) $term->name);
-            $slug = sanitize_title((string) $term->slug);
-
-            if ($name === '') {
-                continue;
-            }
-
-            $existing = term_exists($slug !== '' ? $slug : $name, $taxonomy);
-
-            if (!$existing) {
-                $existing = wp_insert_term($name, $taxonomy, array('slug' => $slug));
-            }
-
-            if (!is_wp_error($existing)) {
-                $map[$kind][(string) $termwp->term_id] = (int) (is_array($existing) ? $existing['term_id'] : $existing);
-            }
-        }
-    }
-
-    return $map;
-}
-
-private static function assign_item_terms($item, $wpns, $post_id, $term_map) {
-    $tax = array('category' => array(), 'tag' => array());
-
-    foreach ($item->category as $cat) {
-        $domain = (string) $cat['domain'];
-        $nicename = (string) $cat['nicename'];
-
-        if ($domain === 'category' && isset($term_map['category'])) {
-            foreach ($term_map['category'] as $id => $mapped) {
-                $term = get_term($mapped, 'category');
-
-                if ($term && ($term->slug === $nicename || $term->name === (string) $cat)) {
-                    $tax['category'][] = $mapped;
+        // Replace imported image URLs in content. Featured images are handled separately above
+        if (!empty($um)) {
+            foreach (get_posts([
+                'post_type' => ['post', 'page'],
+                'post_status' => ['publish', 'future', 'draft', 'pending', 'private'],
+                'numberposts' => -1,
+                'meta_key' => '_swi_source_guid_hash',
+            ]) as $p) {
+                $content = str_replace(array_keys($um), array_values($um), $p->post_content);
+                if ($content !== $p->post_content) {
+                    wp_update_post(['ID' => $p->ID, 'post_content' => $content]);
                 }
             }
-        } elseif ($domain === 'post_tag') {
-            $term = get_term_by('slug', sanitize_title($nicename), 'post_tag');
-
-            if ($term) {
-                $tax['tag'][] = (int) $term->term_id;
-            }
-        }
-    }
-
-    if ($tax['category']) {
-        wp_set_post_terms($post_id, array_values(array_unique($tax['category'])), 'category');
-    }
-
-    if ($tax['tag']) {
-        wp_set_post_terms($post_id, array_values(array_unique($tax['tag'])), 'post_tag');
-    }
-}
-
-private static function import_image($url, $title, $author_id) {
-    // Check for an existing image before downloading.
-    $url_path = wp_parse_url($url, PHP_URL_PATH);
-    $source_filename = sanitize_file_name(
-        rawurldecode(wp_basename((string) $url_path))
-    );
-
-    if ($source_filename !== '') {
-        $source_name = pathinfo($source_filename, PATHINFO_FILENAME);
-
-        $existing_id = self::find_image_by_filename($source_filename);
-
-        // JPEG files may be stored with either .jpg or .jpeg.
-        if ($existing_id === 0) {
-            $extension = strtolower(pathinfo($source_filename, PATHINFO_EXTENSION));
-
-            if (in_array($extension, array('jpg', 'jpeg'), true)) {
-                $alternate_filename = $source_name . ($extension === 'jpg' ? '.jpeg' : '.jpg');
-
-                $existing_id = self::find_image_by_filename($alternate_filename);
-            }
         }
 
-        if ($existing_id > 0) {
-            return $existing_id;
-        }
-    }
-
-    $download = self::safe_download_image($url);
-
-    if (is_wp_error($download)) {
-        return $download;
-    }
-
-    $path = $download['path'];
-    $mime = $download['mime'];
-    $ext = self::ALLOWED_MIMES[$mime];
-    $editor = wp_get_image_editor($path);
-
-    if (is_wp_error($editor)) {
-        @unlink($path);
-        return new WP_Error('swi_image_decode', 'Image could not be decoded by the configured WordPress image editor.');
-    }
-
-    $safe_path = wp_tempnam('swi-safe-image.' . $ext);
-
-    if (!$safe_path) {
-        @unlink($path);
-        return new WP_Error('swi_temp', 'Could not create a temporary image file.');
-    }
-
-    $saved = $editor->save($safe_path, $mime);
-    @unlink($path);
-
-    if (is_wp_error($saved) || empty($saved['path']) || !is_file($saved['path'])) {
-        @unlink($safe_path);
-        return new WP_Error('swi_reencode', 'Image could not be re-encoded safely.');
-    }
-
-    $safe_file = $saved['path'];
-    $safe_mime = isset($saved['mime-type']) ? $saved['mime-type'] : $mime;
-
-    if (!isset(self::ALLOWED_MIMES[$safe_mime]) || filesize($safe_file) > self::MAX_IMAGE_BYTES) {
-        @unlink($safe_file);
-        return new WP_Error('swi_output_type', 'Processed image has an unsupported format or size.');
-    }
-
-    $source_name = $source_filename !== ''
-        ? pathinfo($source_filename, PATHINFO_FILENAME)
-        : sanitize_title($title ?: 'imported-image');
-
-    $filename = sanitize_file_name(
-        $source_name . '.' . self::ALLOWED_MIMES[$safe_mime]
-    );
-
-    $file_array = array('name' => $filename, 'tmp_name' => $safe_file, 'type' => $safe_mime, 'size' => filesize($safe_file), 'error' => 0);
-
-    require_once ABSPATH . 'wp-admin/includes/file.php';
-    require_once ABSPATH . 'wp-admin/includes/media.php';
-    require_once ABSPATH . 'wp-admin/includes/image.php';
-
-    $attachment_id = media_handle_sideload($file_array, 0, sanitize_text_field($title));
-
-    if (is_wp_error($attachment_id)) {
-        if (file_exists($safe_file)) {
-            @unlink($safe_file);
-        }
-
-        return $attachment_id;
-    }
-
-    wp_update_post(array('ID' => $attachment_id, 'post_author' => $author_id));
-    update_post_meta($attachment_id, '_swi_imported_safe_image', 1);
-
-    return $attachment_id;
-}
-
-private static function find_image_by_filename($filename) {
-    global $wpdb;
-
-    $filename = sanitize_file_name($filename);
-
-    if ($filename === '') {
-        return 0;
-    }
-
-    // Search attachment file metadata, then verify the exact basename.
-    $like = '%' . $wpdb->esc_like($filename);
-
-    $attachment_ids = $wpdb->get_col(
-        $wpdb->prepare(
-            "SELECT DISTINCT p.ID
-            FROM {$wpdb->posts} AS p
-            INNER JOIN {$wpdb->postmeta} AS pm
-                ON p.ID = pm.post_id
-            WHERE p.post_type = 'attachment'
-                AND p.post_mime_type IN (
-                    'image/jpeg',
-                    'image/png',
-                    'image/webp'
-                )
-                AND pm.meta_key = '_wp_attached_file'
-                AND pm.meta_value LIKE %s",
-            $like
-        )
-    );
-
-    foreach ($attachment_ids as $attachment_id) {
-        $attached_file = get_post_meta(
-            (int) $attachment_id,
-            '_wp_attached_file',
-            true
-        );
-
-        if (
-            is_string($attached_file) &&
-            wp_basename($attached_file) === $filename &&
-            wp_attachment_is_image((int) $attachment_id)
-        ) {
-            return (int) $attachment_id;
-        }
-    }
-
-    return 0;
-}
-
-private static function safe_download_image($url) {
-    $url = esc_url_raw($url, array('http', 'https'));
-
-    if (!$url || !self::is_public_http_url($url)) {
-        return new WP_Error('swi_url', 'URL is invalid or points to a local/private destination.');
-    }
-
-    $current = $url;
-
-    for ($i = 0; $i <= self::MAX_REDIRECTS; $i++) {
-        if (!self::is_public_http_url($current)) {
-            return new WP_Error('swi_redirect_url', 'Redirect destination is not allowed.');
-        }
-
-        $response = wp_safe_remote_get($current, array(
-            'timeout' => 15,
-            'redirection' => 0,
-            'limit_response_size' => self::MAX_IMAGE_BYTES + 1,
-            'headers' => array('Accept' => 'image/jpeg,image/png,image/webp'),
-            'user-agent' => 'Safe-WXR-Importer/' . self::VERSION . '; ' . home_url('/'),
-            'reject_unsafe_urls' => true,
+        self::redirect(sprintf(
+            'Done. Created:%d Skipped:%d Images imported:%d Image failures:%d Post errors:%d Featured pending:%d Featured assigned:%d Featured failed:%d Featured missing attachment:%d Media limit skipped:%d',
+            $c['cr'], $c['sk'], $c['md'], $c['mf'], $c['er'],
+            $fc['pending'], $fc['assigned'], $fc['failed'], $fc['missing'], $c['media_limit']
         ));
-
-        if (is_wp_error($response)) {
-            return $response;
-        }
-
-        $code = (int) wp_remote_retrieve_response_code($response);
-
-        if (in_array($code, array(301,302,303,307,308), true)) {
-            if ($i >= self::MAX_REDIRECTS) {
-                return new WP_Error('swi_redirect_limit', 'Too many redirects while downloading image.');
-            }
-
-            $location = wp_remote_retrieve_header($response, 'location');
-
-            if (!$location) {
-                return new WP_Error('swi_redirect_missing', 'Redirect did not include a destination.');
-            }
-
-            $current = WP_Http::make_absolute_url($location, $current);
-            continue;
-        }
-
-        if ($code !== 200) {
-            return new WP_Error('swi_http_status', 'Image server returned HTTP status ' . $code . '.');
-        }
-
-        $body = wp_remote_retrieve_body($response);
-
-        if (!is_string($body) || $body === '' || strlen($body) > self::MAX_IMAGE_BYTES) {
-            return new WP_Error('swi_size', 'Image is empty or exceeds the 12 MB limit.');
-        }
-
-        $tmp = wp_tempnam('swi-download');
-
-        if (!$tmp) {
-            return new WP_Error('swi_temp', 'Could not create a temporary download file.');
-        }
-
-        if (file_put_contents($tmp, $body, LOCK_EX) === false) {
-            @unlink($tmp);
-            return new WP_Error('swi_write', 'Could not save downloaded image.');
-        }
-
-        $detected = self::detect_image_mime($tmp);
-
-        if (!$detected) {
-            @unlink($tmp);
-            return new WP_Error('swi_mime', 'Downloaded file is not an approved JPEG, PNG, or WebP image.');
-        }
-
-        return array('path' => $tmp, 'mime' => $detected);
     }
 
-    return new WP_Error('swi_download', 'Image download failed.');
-}
-
-private static function detect_image_mime($path) {
-    if (!is_file($path) || filesize($path) < 12 || filesize($path) > self::MAX_IMAGE_BYTES) {
-        return false;
-    }
-
-    $finfo = function_exists('finfo_open') ? finfo_open(FILEINFO_MIME_TYPE) : false;
-    $mime = $finfo ? finfo_file($finfo, $path) : '';
-
-    if ($finfo) {
-        finfo_close($finfo);
-    }
-
-    if (!isset(self::ALLOWED_MIMES[$mime])) {
-        return false;
-    }
-
-    $info = @getimagesize($path);
-
-    if (!$info || empty($info['mime']) || $info['mime'] !== $mime) {
-        return false;
-    }
-
-    // Validate file signatures independently of the file extension and HTTP Content-Type
-    $head = file_get_contents($path, false, null, 0, 16);
-
-    if ($mime === 'image/jpeg' && substr((string)$head, 0, 3) !== "\xFF\xD8\xFF") {
-        return false;
-    }
-
-    if ($mime === 'image/png' && substr((string)$head, 0, 8) !== "\x89PNG\r\n\x1A\n") {
-        return false;
-    }
-
-    if ($mime === 'image/webp' && (substr((string)$head, 0, 4) !== 'RIFF' || substr((string)$head, 8, 4) !== 'WEBP')) {
-        return false;
-    }
-
-    return $mime;
-}
-
-private static function is_public_http_url($url) {
-    $parts = wp_parse_url($url);
-
-    if (!$parts || empty($parts['scheme']) || empty($parts['host']) || !in_array(strtolower($parts['scheme']), array('http','https'), true)) {
-        return false;
-    }
-
-    if (isset($parts['user']) || isset($parts['pass'])) {
-        return false;
-    }
-
-    $host = strtolower(rtrim($parts['host'], '.'));
-
-    if ($host === 'localhost' || substr($host, -10) === '.localhost' || substr($host, -6) === '.local' || substr($host, -4) === '.lan' || substr($host, -7) === '.internal') {
-        return false;
-    }
-
-    if (filter_var($host, FILTER_VALIDATE_IP)) {
-        return (bool) filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
-    }
-
-    // Resolve A and AAAA records where possible and reject any non-public answer
-    $ips = array();
-
-    if (function_exists('dns_get_record')) {
-        $records = @dns_get_record($host, DNS_A + DNS_AAAA);
-
-        if (is_array($records)) {
-            foreach ($records as $record) {
-                if (!empty($record['ip'])) {
-                    $ips[] = $record['ip'];
+    private static function it($ch, $wpns) {
+        $map = ['category' => [], 'tag' => []];
+        foreach (['category' => 'category', 'tag' => 'tag'] as $k => $tax) {
+            foreach ($ch->children($wpns)->{$k} as $term) {
+                $tw = $term->children($wpns);
+                $n = sanitize_text_field((string) $term->name);
+                $s = sanitize_title((string) $term->slug);
+                if ($n === '') {
+                    continue;
                 }
-
-                if (!empty($record['ipv6'])) {
-                    $ips[] = $record['ipv6'];
+                $e = term_exists($s !== '' ? $s : $n, $tax);
+                if (!$e) {
+                    $e = wp_insert_term($n, $tax, ['slug' => $s]);
+                }
+                if (!is_wp_error($e)) {
+                    $map[$k][(string) $tw->term_id] = (int) (is_array($e) ? $e['term_id'] : $e);
                 }
             }
         }
+        return $map;
     }
 
-    if (!$ips) {
-        $resolved = @gethostbynamel($host);
-
-        if (is_array($resolved)) {
-            $ips = $resolved;
+    private static function at($item, $wpns, $pid, $tm) {
+        $tax = ['category' => [], 'tag' => []];
+        foreach ($item->category as $cat) {
+            $d = (string) $cat['domain'];
+            $n = (string) $cat['nicename'];
+            if ($d === 'category' && isset($tm['category'])) {
+                foreach ($tm['category'] as $m) {
+                    $t = get_term($m, 'category');
+                    if ($t && ($t->slug === $n || $t->name === (string) $cat)) {
+                        $tax['category'][] = $m;
+                    }
+                }
+            } elseif ($d === 'post_tag') {
+                $t = get_term_by('slug', sanitize_title($n), 'post_tag');
+                if ($t) {
+                    $tax['tag'][] = (int) $t->term_id;
+                }
+            }
+        }
+        if ($tax['category']) {
+            wp_set_post_terms($pid, array_values(array_unique($tax['category'])), 'category');
+        }
+        if ($tax['tag']) {
+            wp_set_post_terms($pid, array_values(array_unique($tax['tag'])), 'post_tag');
         }
     }
 
-    if (!$ips) {
-        return false;
+    private static function ii($url, $title, $uid) {
+        // Deliberately do not reuse attachments by filename: identical filenames can contain different images
+        $source_path = wp_parse_url($url, PHP_URL_PATH);
+        $source_filename = sanitize_file_name(rawurldecode(wp_basename((string) $source_path)));
+        $download = self::sdi($url);
+        if (is_wp_error($download)) {
+            return $download;
+        }
+
+        $path = $download['path'];
+        $mime = $download['mime'];
+        $editor = wp_get_image_editor($path);
+        if (is_wp_error($editor)) {
+            @unlink($path);
+            return new WP_Error('swi_decode', 'Image decode failed.');
+        }
+
+        $safe_path = wp_tempnam('swi.' . self::AM[$mime]);
+        if (!$safe_path) {
+            @unlink($path);
+            return new WP_Error('swi_temp', 'Could not create temporary file.');
+        }
+        $saved = $editor->save($safe_path, $mime);
+        @unlink($path);
+        if (is_wp_error($saved) || empty($saved['path']) || !is_file($saved['path'])) {
+            @unlink($safe_path);
+            return new WP_Error('swi_reenc', 'Image re-encoding failed.');
+        }
+
+        $final_path = $saved['path'];
+        $saved_mime = isset($saved['mime-type']) ? $saved['mime-type'] : $mime;
+        if (!isset(self::AM[$saved_mime]) || !is_file($final_path) || filesize($final_path) > self::MI) {
+            @unlink($final_path);
+            return new WP_Error('swi_out', 'Invalid image output.');
+        }
+
+        $base = $source_filename !== '' ? pathinfo($source_filename, PATHINFO_FILENAME) : sanitize_title($title ?: 'image');
+        if ($base === '') {
+            $base = 'image';
+        }
+        $filename = sanitize_file_name($base . '.' . self::AM[$saved_mime]);
+        $file_array = [
+            'name' => $filename,
+            'tmp_name' => $final_path,
+            'type' => $saved_mime,
+            'size' => filesize($final_path),
+            'error' => 0,
+        ];
+
+        require_once ABSPATH . 'wp-admin/includes/file.php';
+        require_once ABSPATH . 'wp-admin/includes/media.php';
+        require_once ABSPATH . 'wp-admin/includes/image.php';
+        $attachment_id = media_handle_sideload($file_array, 0, sanitize_text_field($title));
+        if (is_wp_error($attachment_id)) {
+            if (file_exists($final_path)) {
+                @unlink($final_path);
+            }
+            return $attachment_id;
+        }
+        wp_update_post(['ID' => $attachment_id, 'post_author' => $uid]);
+        update_post_meta($attachment_id, '_swi_imported_safe_image', 1);
+        return (int) $attachment_id;
     }
 
-    foreach (array_unique($ips) as $ip) {
-        if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+    private static function sdi($url) {
+        $url = esc_url_raw($url, ['http', 'https']);
+        if (!$url || !self::ipu($url)) {
+            return new WP_Error('swi_url', 'Invalid or private URL.');
+        }
+        $current = $url;
+        for ($i = 0; $i <= self::MR; $i++) {
+            if (!self::ipu($current)) {
+                return new WP_Error('swi_redir', 'Invalid redirect destination.');
+            }
+            $response = wp_safe_remote_get($current, [
+                'timeout' => 15,
+                'redirection' => 0,
+                'limit_response_size' => self::MI + 1,
+                'headers' => ['Accept' => 'image/jpeg,image/png,image/webp'],
+                'user-agent' => 'SWI/' . self::V . '; ' . home_url('/'),
+                'reject_unsafe_urls' => true,
+            ]);
+            if (is_wp_error($response)) {
+                return $response;
+            }
+            $code = (int) wp_remote_retrieve_response_code($response);
+            if (in_array($code, [301, 302, 303, 307, 308], true)) {
+                if ($i >= self::MR) {
+                    return new WP_Error('swi_redir_max', 'Too many redirects.');
+                }
+                $location = wp_remote_retrieve_header($response, 'location');
+                if (!$location) {
+                    return new WP_Error('swi_redir_no', 'Redirect has no location.');
+                }
+                $current = WP_Http::make_absolute_url($location, $current);
+                continue;
+            }
+            if ($code !== 200) {
+                return new WP_Error('swi_http', 'HTTP ' . $code . '.');
+            }
+            $body = wp_remote_retrieve_body($response);
+            if (!is_string($body) || $body === '' || strlen($body) > self::MI) {
+                return new WP_Error('swi_size', 'Invalid or oversized image response.');
+            }
+            $tmp = wp_tempnam('swi-dl');
+            if (!$tmp) {
+                return new WP_Error('swi_temp', 'Could not create temporary file.');
+            }
+            if (file_put_contents($tmp, $body, LOCK_EX) === false) {
+                @unlink($tmp);
+                return new WP_Error('swi_write', 'Could not write temporary file.');
+            }
+            $detected = self::dim($tmp);
+            if (!$detected) {
+                @unlink($tmp);
+                return new WP_Error('swi_mime', 'Response is not a supported valid image.');
+            }
+            return ['path' => $tmp, 'mime' => $detected];
+        }
+        return new WP_Error('swi_dl', 'Download failed.');
+    }
+
+    private static function dim($path) {
+        if (!is_file($path) || filesize($path) < 12 || filesize($path) > self::MI) {
             return false;
         }
+        $fi = function_exists('finfo_open') ? finfo_open(FILEINFO_MIME_TYPE) : false;
+        $mime = $fi ? finfo_file($fi, $path) : '';
+        if ($fi) {
+            finfo_close($fi);
+        }
+        if (!isset(self::AM[$mime])) {
+            return false;
+        }
+        $info = @getimagesize($path);
+        if (!$info || empty($info['mime']) || $info['mime'] !== $mime) {
+            return false;
+        }
+        $head = file_get_contents($path, false, null, 0, 16);
+        if ($mime === 'image/jpeg' && substr((string) $head, 0, 3) !== "\xFF\xD8\xFF") {
+            return false;
+        }
+        if ($mime === 'image/png' && substr((string) $head, 0, 8) !== "\x89PNG\r\n\x1A\n") {
+            return false;
+        }
+        if ($mime === 'image/webp' && (substr((string) $head, 0, 4) !== 'RIFF' || substr((string) $head, 8, 4) !== 'WEBP')) {
+            return false;
+        }
+        return $mime;
     }
 
-    return true;
-}
+    private static function ipu($url) {
+        $parts = wp_parse_url($url);
+        if (!$parts || empty($parts['scheme']) || empty($parts['host']) || !in_array(strtolower($parts['scheme']), ['http', 'https'], true)) {
+            return false;
+        }
+        if (isset($parts['user']) || isset($parts['pass'])) {
+            return false;
+        }
+        $host = strtolower(rtrim($parts['host'], '.'));
+        if ($host === 'localhost' || substr($host, -10) === '.localhost' || substr($host, -6) === '.local' || substr($host, -4) === '.lan' || substr($host, -9) === '.internal') {
+            return false;
+        }
+        if (filter_var($host, FILTER_VALIDATE_IP)) {
+            return (bool) filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+        }
 
-private static function safe_date($date) {
-    if (!$date) {
-        return current_time('mysql');
+        $ips = [];
+        if (function_exists('dns_get_record')) {
+            $records = @dns_get_record($host, DNS_A + DNS_AAAA);
+            if (is_array($records)) {
+                foreach ($records as $record) {
+                    if (!empty($record['ip'])) {
+                        $ips[] = $record['ip'];
+                    }
+                    if (!empty($record['ipv6'])) {
+                        $ips[] = $record['ipv6'];
+                    }
+                }
+            }
+        }
+        if (!$ips) {
+            $resolved = @gethostbynamel($host);
+            if (is_array($resolved)) {
+                $ips = $resolved;
+            }
+        }
+        if (!$ips) {
+            return false;
+        }
+        foreach (array_unique($ips) as $ip) {
+            if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                return false;
+            }
+        }
+        return true;
     }
 
-    $timestamp = strtotime($date);
-
-    if (!$timestamp || $timestamp < 0) {
-        return current_time('mysql');
+    private static function sd($date) {
+        if (!$date) {
+            return current_time('mysql');
+        }
+        $timestamp = strtotime($date);
+        if (!$timestamp || $timestamp < 0) {
+            return current_time('mysql');
+        }
+        return gmdate('Y-m-d H:i:s', $timestamp);
     }
 
-    return gmdate('Y-m-d H:i:s', $timestamp);
-}
-
-private static function redirect($message) {
-    wp_safe_redirect(add_query_arg(array('page' => 'safe-wxr-importer', 'swi_result' => rawurlencode($message)), admin_url('tools.php')));
-    exit;
-}
+    private static function redirect($message) {
+        wp_safe_redirect(add_query_arg(['page' => 'safe-wxr-importer', 'swi_result' => $message], admin_url('tools.php')));
+        exit;
+    }
 }
 
 Safe_WXR_Importer::init();
